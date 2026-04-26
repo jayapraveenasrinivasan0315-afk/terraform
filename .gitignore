@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Logs
+*.log
+npm-debug.log*
+
+#docs
+DEPLOYMENT_QUICKSTART.md
+GCP_DEPLOYMENT_CONFIG.md
+GITHUB_SECRETS_SETUP.md
