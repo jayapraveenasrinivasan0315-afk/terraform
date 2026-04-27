@@ -363,7 +363,7 @@ jobs:
           image: asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ inputs.artifact_repo }}/${{ inputs.app_name }}:${{ github.sha }}
           region: ${{ inputs.region }}
           env_vars: |
-            DATABASE_URL=postgresql://appuser:${{ secrets.DATABASE_PASSWORD }}@//myapp?host=/cloudsql/${{ secrets.GCP_PROJECT_ID }}:asia-south1:myapp-sql-instance
+            DATABASE_URL=postgresql://appuser:${{ env.DATABASE_PASSWORD || secrets.DATABASE_PASSWORD }}@//myapp?host=/cloudsql/${{ secrets.GCP_PROJECT_ID }}:asia-south1:myapp-sql-instance
             DB_NAME=myapp
             FRONTEND_URL=${{ secrets.FRONTEND_URL }}
             API_BASE_URL=${{ secrets.API_BASE_URL }}
