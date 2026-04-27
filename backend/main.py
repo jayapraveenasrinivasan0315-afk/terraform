@@ -14,7 +14,8 @@ from urllib.parse import urlparse
 # Format: postgresql://user:password@/dbname?unix_socket_dir=/cloudsql/PROJECT:REGION:INSTANCE
 # For local PostgreSQL: postgresql://postgres:postgres@localhost:5432/names_db
 DATABASE_URL = os.environ.get(
-    DATABASE_URL = "postgresql://myapp_user:changeme123!@/DB_NAME?host=/cloudsql/gwx-devops-internship:asia-south1:myapp-sql-instance"
+    "DATABASE_URL",
+    "postgresql://myapp_user:changeme123!@/DB_NAME?host=/cloudsql/gwx-devops-internship:asia-south1:myapp-sql-instance"
 )
 
 # Parse the database URL to extract components
@@ -127,4 +128,5 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
