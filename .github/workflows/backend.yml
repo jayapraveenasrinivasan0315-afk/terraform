@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   deploy-backend:
-    uses: ./.github/workflows/_reusable-deploy.yml
+    uses: ./.github/workflows/reusable-workflow.yml
     with:
       deployment_type: backend
       environment: development   
