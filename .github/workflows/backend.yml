@@ -2,11 +2,11 @@ name: Deploy to GCP (Frontend + Backend)
 
 on:
   workflow_dispatch:
-  inputs:
-    environment:
-      description: 'Deployment environment (e.g., staging, production)'
-      required: true
-      default: 'dev'
+    inputs:
+      environment:
+        description: 'Deployment environment (e.g., staging, production)'
+        required: true
+        default: 'dev'
 
 env:
   PROJECT_ID: gwx-devops-internship
