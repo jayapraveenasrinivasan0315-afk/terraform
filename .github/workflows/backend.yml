@@ -1,10 +1,12 @@
 name: Deploy to GCP (Frontend + Backend)
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
+  inputs:
+    environment:
+      description: 'Deployment environment (e.g., staging, production)'
+      required: true
+      default: 'dev'
 
 env:
   PROJECT_ID: gwx-devops-internship
@@ -25,6 +27,7 @@ jobs:
   deploy-frontend:
     name: Deploy Frontend to GCS
     runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
     
     steps:
       - name: Checkout code
