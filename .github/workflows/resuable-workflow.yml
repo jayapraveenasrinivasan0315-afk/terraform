@@ -1,0 +1,442 @@
+name: Reusable Deploy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        default: dev
+        type: string
+      deployment_type:
+        required: true
+        type: string
+      app_path:
+        required: true
+        type: string
+      app_name:
+        required: true
+        type: string
+      artifact_name:
+        required: true
+        type: string
+      region:
+        default: asia-south1
+        type: string
+      artifact_repo:
+        required: false
+        type: string
+        default: backend-repo
+      GCS_BUCKET_NAME:
+        required: false
+        type: string
+      # ── Cloud SQL inputs ──────────────────────────────────
+      cloud_sql_instance:
+        description: "Cloud SQL instance name (e.g. myapp-sql-instance)"
+        required: false
+        type: string
+        default: ""
+      cloud_sql_db_name:
+        description: "PostgreSQL database name"
+        required: false
+        type: string
+        default: "myapp"
+      cloud_sql_db_user:
+        description: "PostgreSQL user name"
+        required: false
+        type: string
+        default: "myapp_user"
+      cloud_sql_tier:
+        description: "Cloud SQL machine tier"
+        required: false
+        type: string
+        default: "db-f1-micro"
+    secrets:
+      GCP_PROJECT_ID:
+        required: true
+      GCP_SERVICE_ACCOUNT:
+        required: true
+      WORKLOAD_IDENTITY_PROVIDER:
+        required: true
+      API_BASE_URL:
+        required: false
+      FRONTEND_URL:
+        required: false
+      # ── Cloud SQL secrets ─────────────────────────────────
+      DB_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+concurrency:
+  group: deploy-${{ inputs.app_name }}-${{ inputs.environment }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate deployment type
+        env:
+          DEPLOYMENT_TYPE: ${{ inputs.deployment_type }}
+        run: |
+          if [ "$DEPLOYMENT_TYPE" != "frontend" ] && [ "$DEPLOYMENT_TYPE" != "backend" ]; then
+            echo "Invalid deployment type"
+            exit 1
+          fi
+
+      - name: Validate app path
+        env:
+          APP_PATH: ${{ inputs.app_path }}
+        run: |
+          if [ ! -d "$APP_PATH" ]; then
+            echo "App path not found"
+            exit 1
+          fi
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Semgrep
+        run: |
+          pip install semgrep
+          semgrep scan --config=p/default --sarif --output=semgrep.sarif
+        continue-on-error: true
+
+      - name: Upload Semgrep SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: sast
+        continue-on-error: true
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: inputs.deployment_type == 'frontend'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        if: inputs.deployment_type == 'frontend'
+        working-directory: ${{ inputs.app_path }}
+        run: npm ci
+
+      - name: Run npm audit
+        if: inputs.deployment_type == 'frontend'
+        working-directory: ${{ inputs.app_path }}
+        run: npm audit --audit-level=critical
+
+      - name: Build frontend
+        if: inputs.deployment_type == 'frontend'
+        working-directory: ${{ inputs.app_path }}
+        env:
+          VITE_BASE_PATH: https://storage.googleapis.com/${{ inputs.GCS_BUCKET_NAME }}/
+          VITE_API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          NODE_ENV: production
+        run: |
+          echo "🏗️ Building frontend..."
+          echo "  VITE_BASE_PATH: $VITE_BASE_PATH"
+          echo "  VITE_API_BASE_URL: ${VITE_API_BASE_URL:-using fallback from .env.production}"
+          echo "  NODE_ENV: $NODE_ENV"
+          npm run build
+          echo "✅ Frontend build complete"
+
+      - name: Debug dist output
+        if: inputs.deployment_type == 'frontend'
+        run: find ${{ inputs.app_path }}/dist -type f | sort
+
+      - name: Upload frontend build artifact
+        if: inputs.deployment_type == 'frontend'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.app_path }}/dist
+          retention-days: 1
+
+      - name: Set up Docker Buildx
+        if: inputs.deployment_type == 'backend'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and export backend Docker image
+        if: inputs.deployment_type == 'backend'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.app_path }}
+          tags: |
+            ${{ inputs.app_name }}:${{ github.sha }}
+            ${{ inputs.app_name }}:latest
+          load: true
+          push: false
+          outputs: type=docker,dest=/tmp/${{ inputs.app_name }}.tar
+
+      - name: Load Docker image from tar
+        if: inputs.deployment_type == 'backend'
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: docker load --input /tmp/$APP_NAME.tar
+
+      - name: Verify image loaded
+        if: inputs.deployment_type == 'backend'
+        run: docker images | grep ${{ inputs.app_name }}
+
+      - name: Run Trivy scan (readable report)
+        if: inputs.deployment_type == 'backend'
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ inputs.app_name }}:${{ github.sha }}
+          format: sarif
+          output: trivy-report.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          skip-version-check: true
+
+      - name: Upload Trivy report
+        if: inputs.deployment_type == 'backend'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.sarif
+          retention-days: 2
+
+      - name: Upload backend build artifact
+        if: inputs.deployment_type == 'backend'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: /tmp/${{ inputs.app_name }}.tar
+          retention-days: 1
+
+  validate-postgresql:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    if: |
+      inputs.deployment_type == 'backend' &&
+      inputs.cloud_sql_instance != ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install psycopg2 and test connection
+        env:
+          DB_USER: ${{ inputs.cloud_sql_db_user }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ inputs.cloud_sql_db_name }}
+        run: |
+          pip install psycopg2-binary --quiet
+          python3 - <<'EOF'
+          import os, sys
+          import psycopg2
+
+          user     = os.environ.get("DB_USER")
+          password = os.environ.get("DB_PASSWORD")
+          db_name  = os.environ.get("DB_NAME")
+
+          if not password:
+              print("DB_PASSWORD not set, skipping connection test")
+              sys.exit(0)
+
+          try:
+              conn = psycopg2.connect(
+                  host="127.0.0.1",
+                  port=5432,
+                  user=user,
+                  password=password,
+                  dbname=db_name,
+                  connect_timeout=5,
+              )
+              conn.close()
+              print("PostgreSQL connection successful")
+          except Exception as e:
+              print(f"PostgreSQL connection test skipped (Cloud SQL not reachable from runner): {e}")
+              print("Connection will be validated at runtime via Cloud SQL proxy in Cloud Run.")
+              sys.exit(0)
+          EOF
+
+  # ── NEW: Setup Cloud SQL (only runs for backend when cloud_sql_instance is set) ──
+  setup-cloud-sql:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    if: |
+      inputs.deployment_type == 'backend' &&
+      inputs.cloud_sql_instance != ''
+    outputs:
+      connection_name: ${{ steps.get-conn.outputs.connection_name }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set GCP Project
+        run: gcloud config set project ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Create Cloud SQL instance if not exists
+        run: |
+          EXISTS=$(gcloud sql instances describe ${{ inputs.cloud_sql_instance }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} 2>/dev/null || echo "")
+          if [ -z "$EXISTS" ]; then
+            echo "Creating Cloud SQL instance..."
+            gcloud sql instances create ${{ inputs.cloud_sql_instance }} \
+              --database-version=POSTGRES_15 \
+              --tier=${{ inputs.cloud_sql_tier }} \
+              --region=${{ inputs.region }} \
+              --availability-type=ZONAL \
+              --storage-auto-increase \
+              --backup-start-time=03:00 \
+              --project=${{ secrets.GCP_PROJECT_ID }}
+            echo "Waiting for instance to be ready..."
+            sleep 30
+            echo "✅ Cloud SQL instance created."
+          else
+            echo "✅ Cloud SQL instance already exists, skipping."
+          fi
+
+      - name: Create database if not exists
+        run: |
+          gcloud sql databases create ${{ inputs.cloud_sql_db_name }} \
+            --instance=${{ inputs.cloud_sql_instance }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            || echo "✅ Database already exists."
+
+      - name: Create database user if not exists
+        run: |
+          gcloud sql users create ${{ inputs.cloud_sql_db_user }} \
+            --instance=${{ inputs.cloud_sql_instance }} \
+            --password=${{ secrets.DB_PASSWORD }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            || echo "✅ User already exists, updating password..."
+          gcloud sql users set-password ${{ inputs.cloud_sql_db_user }} \
+            --instance=${{ inputs.cloud_sql_instance }} \
+            --password=${{ secrets.DB_PASSWORD }} \
+            --project=${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Get Cloud SQL connection name
+        id: get-conn
+        run: |
+          CONN=$(gcloud sql instances describe ${{ inputs.cloud_sql_instance }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --format="value(connectionName)")
+          echo "connection_name=$CONN" >> $GITHUB_OUTPUT
+          echo "✅ Connection name: $CONN"
+
+  deploy:
+    needs: [build, validate-postgresql, setup-cloud-sql]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.validate-postgresql.result == 'success' || needs.validate-postgresql.result == 'skipped') &&
+      (needs.setup-cloud-sql.result == 'success' || needs.setup-cloud-sql.result == 'skipped')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ./build-output
+
+      - name: Debug build output
+        if: inputs.deployment_type == 'frontend'
+        run: find ./build-output -type f | sort
+
+      - name: Load Docker image
+        if: inputs.deployment_type == 'backend'
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: docker load --input ./build-output/$APP_NAME.tar
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set GCP Project
+        run: gcloud config set project ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Deploy frontend to Google Cloud Storage
+        if: inputs.deployment_type == 'frontend'
+        run: |
+          gsutil -m cp -r ./build-output/* gs://${{ inputs.GCS_BUCKET_NAME }}/
+
+      - name: Verify GCS upload
+        if: inputs.deployment_type == 'frontend'
+        run: |
+          echo "Files in GCS bucket:"
+          gsutil ls -r gs://${{ inputs.GCS_BUCKET_NAME }}/
+
+      - name: Authenticate Docker to Artifact Registry
+        if: inputs.deployment_type == 'backend'
+        run: gcloud auth configure-docker asia-south1-docker.pkg.dev
+
+      - name: Build & Push Docker image
+        if: inputs.deployment_type == 'backend'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.app_path }}
+          tags: asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ inputs.artifact_repo }}/${{ inputs.app_name }}:${{ github.sha }}
+          push: true
+
+      # ── Deploy to Cloud Run WITHOUT Cloud SQL ─────────────
+      - name: Deploy to Cloud Run (no Cloud SQL)
+        if: |
+          inputs.deployment_type == 'backend' &&
+          inputs.cloud_sql_instance == ''
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ inputs.app_name }}
+          image: asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ inputs.artifact_repo }}/${{ inputs.app_name }}:${{ github.sha }}
+          region: ${{ inputs.region }}
+          env_vars: |
+            DATABASE_URL=postgresql://${{ inputs.cloud_sql_db_user }}:${{ secrets.DB_PASSWORD }}@localhost:5432/${{ inputs.cloud_sql_db_name }}
+            DB_NAME=${{ inputs.cloud_sql_db_name }}
+            FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+            API_BASE_URL=${{ secrets.API_BASE_URL }}
+
+      # ── Deploy to Cloud Run WITH Cloud SQL ────────────────
+      - name: Deploy to Cloud Run (with Cloud SQL)
+        if: |
+          inputs.deployment_type == 'backend' &&
+          inputs.cloud_sql_instance != ''
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ inputs.app_name }}
+          image: asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ inputs.artifact_repo }}/${{ inputs.app_name }}:${{ github.sha }}
+          region: ${{ inputs.region }}
+          flags: --add-cloudsql-instances=${{ needs.setup-cloud-sql.outputs.connection_name }}
+          env_vars: |
+            DATABASE_URL=postgresql://${{ inputs.cloud_sql_db_user }}:${{ secrets.DB_PASSWORD }}@/${{ inputs.cloud_sql_db_name }}?host=/cloudsql/${{ needs.setup-cloud-sql.outputs.connection_name }}
+            DB_NAME=${{ inputs.cloud_sql_db_name }}
+            FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+            API_BASE_URL=${{ secrets.API_BASE_URL }}

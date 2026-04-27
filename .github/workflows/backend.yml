@@ -1,306 +1,494 @@
-name: Deploy to GCP (Frontend + Backend)
+name: Reusable Deploy Workflow
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       environment:
-        description: 'Deployment environment (e.g., staging, production)'
+        description: 'Deployment environment (development, staging, production)'
+        default: development
+        type: string
+      deployment_type:
+        description: 'Type of deployment (frontend or backend)'
         required: true
-        default: 'dev'
+        type: string
+      app_path:
+        description: 'Path to the application directory'
+        required: true
+        type: string
+      app_name:
+        description: 'Name of the application'
+        required: true
+        type: string
+      artifact_name:
+        description: 'Name for the build artifact'
+        required: true
+        type: string
+      region:
+        description: 'GCP region for deployment'
+        default: asia-south1
+        type: string
+      artifact_repo:
+        description: 'Artifact Registry repository name'
+        required: false
+        type: string
+        default: backend-repo
+      GCS_BUCKET_NAME:
+        description: 'GCS bucket name for frontend deployment'
+        required: false
+        type: string
+      cloud_run_service:
+        description: 'Cloud Run service name for backend'
+        required: false
+        type: string
+        default: backend-service
+      container_port:
+        description: 'Container port for backend'
+        required: false
+        type: string
+        default: '8080'
+    secrets:
+      GCP_PROJECT_ID:
+        description: 'GCP Project ID'
+        required: true
+      GCP_SERVICE_ACCOUNT:
+        description: 'GCP Service Account email'
+        required: true
+      WORKLOAD_IDENTITY_PROVIDER:
+        description: 'Workload Identity Provider URI'
+        required: true
+      MONGODB_URL:
+        description: 'MongoDB connection URL'
+        required: false
+      API_BASE_URL:
+        description: 'API base URL'
+        required: false
+      FRONTEND_URL:
+        description: 'Frontend URL'
+        required: false
+      DB_PASSWORD:
+        description: 'Database password'
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+concurrency:
+  group: deploy-${{ inputs.app_name }}-${{ inputs.environment }}
+  cancel-in-progress: true
 
 env:
-  PROJECT_ID: gwx-devops-internship
-  REGION: asia-south1
-  ARTIFACT_REGISTRY_REPO: backend-repo
-  ARTIFACT_REGISTRY_LOCATION: asia-south1
-  GCS_FRONTEND_BUCKET: gw-devops-frontend-bucket
-  CLOUD_RUN_SERVICE: backend-service
-  SQL_INSTANCE: myapp-sql-instance
-  DB_NAME: myapp
-  DB_USER: myapp_user
-  CONTAINER_PORT: 8080
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: ${{ inputs.region }}
+  ARTIFACT_REGISTRY_LOCATION: ${{ inputs.region }}
 
 jobs:
   # ============================================================
-  # JOB 1: Build & Deploy Frontend to GCS
+  # Validation Job
   # ============================================================
-  deploy-frontend:
-    name: Deploy Frontend to GCS
+  validate:
+    name: Validate Configuration
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    outputs:
+      valid: ${{ steps.validate.outputs.valid }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate deployment type
+        id: validate
+        env:
+          DEPLOYMENT_TYPE: ${{ inputs.deployment_type }}
+          APP_PATH: ${{ inputs.app_path }}
+        run: |
+          echo "🔍 Validating deployment configuration..."
+          
+          # Validate deployment type
+          if [ "$DEPLOYMENT_TYPE" != "frontend" ] && [ "$DEPLOYMENT_TYPE" != "backend" ]; then
+            echo "❌ Invalid deployment type: $DEPLOYMENT_TYPE"
+            echo "   Must be 'frontend' or 'backend'"
+            exit 1
+          fi
+          
+          # Validate app path exists
+          if [ ! -d "$APP_PATH" ]; then
+            echo "❌ App path not found: $APP_PATH"
+            exit 1
+          fi
+          
+          # Validate frontend-specific requirements
+          if [ "$DEPLOYMENT_TYPE" = "frontend" ]; then
+            if [ ! -f "$APP_PATH/package.json" ]; then
+              echo "❌ package.json not found in $APP_PATH"
+              exit 1
+            fi
+            echo "✅ Frontend configuration valid"
+          fi
+          
+          # Validate backend-specific requirements
+          if [ "$DEPLOYMENT_TYPE" = "backend" ]; then
+            if [ ! -f "$APP_PATH/Dockerfile" ]; then
+              echo "❌ Dockerfile not found in $APP_PATH"
+              exit 1
+            fi
+            if [ ! -f "$APP_PATH/requirements.txt" ] && [ ! -f "$APP_PATH/package.json" ]; then
+              echo "❌ Neither requirements.txt nor package.json found in $APP_PATH"
+              exit 1
+            fi
+            echo "✅ Backend configuration valid"
+          fi
+          
+          echo "valid=true" >> $GITHUB_OUTPUT
+
+      - name: Run Gitleaks (Secret Detection)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Run Semgrep (SAST)
+        run: |
+          pip install semgrep --quiet
+          echo "🔐 Running Semgrep static analysis..."
+          semgrep scan --config=p/default --sarif --output=semgrep.sarif || true
+          echo "✅ Semgrep scan complete"
+        continue-on-error: true
+
+      - name: Upload Semgrep SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: sast
+        continue-on-error: true
+
+      - name: Validate environment
+        run: |
+          echo "📋 Deployment Summary:"
+          echo "  Environment: ${{ inputs.environment }}"
+          echo "  Type: ${{ inputs.deployment_type }}"
+          echo "  Path: ${{ inputs.app_path }}"
+          echo "  Region: ${{ inputs.region }}"
+          echo "  Service Account: ${{ secrets.GCP_SERVICE_ACCOUNT }}"
+
+  # ============================================================
+  # Build Job (Frontend & Backend)
+  # ============================================================
+  build:
+    name: Build Application
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.image-uri.outputs.uri }}
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      # ==================== FRONTEND BUILD ====================
+      - name: Setup Node.js (Frontend)
+        if: inputs.deployment_type == 'frontend'
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
           cache: 'npm'
-          cache-dependency-path: 'frontend/package-lock.json'
+          cache-dependency-path: '${{ inputs.app_path }}/package-lock.json'
 
-      - name: Install dependencies
-        working-directory: ./frontend
-        run: npm ci
+      - name: Install frontend dependencies
+        if: inputs.deployment_type == 'frontend'
+        working-directory: ${{ inputs.app_path }}
+        run: |
+          echo "📦 Installing dependencies..."
+          npm ci
+
+      - name: Run npm audit (Security)
+        if: inputs.deployment_type == 'frontend'
+        working-directory: ${{ inputs.app_path }}
+        run: |
+          echo "🔒 Running npm audit..."
+          npm audit --audit-level=moderate || true
+        continue-on-error: true
 
       - name: Build frontend
-        working-directory: ./frontend
-        run: npm run build
+        if: inputs.deployment_type == 'frontend'
+        working-directory: ${{ inputs.app_path }}
         env:
-          VITE_API_URL: /api
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-       
-
-      - name: Setup Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.PROJECT_ID }}
-
-      - name: Deploy frontend to GCS
+          VITE_BASE_PATH: ${{ secrets.FRONTEND_URL && format('{0}/', secrets.FRONTEND_URL) || '/' }}
+          VITE_API_BASE_URL: ${{ secrets.API_BASE_URL || 'http://localhost:8080' }}
+          NODE_ENV: production
         run: |
-          gsutil -m rsync -r -d frontend/dist gs://${{ env.GCS_FRONTEND_BUCKET }}/
-          gsutil -h "Cache-Control:no-cache" -m cp gs://${{ env.GCS_FRONTEND_BUCKET }}/index.html gs://${{ env.GCS_FRONTEND_BUCKET }}/index.html
+          echo "🏗️ Building frontend..."
+          echo "  VITE_BASE_PATH: ${VITE_BASE_PATH}"
+          echo "  VITE_API_BASE_URL: ${VITE_API_BASE_URL}"
+          echo "  NODE_ENV: $NODE_ENV"
+          npm run build
+          echo "✅ Frontend build complete"
 
-      - name: Clear GCS cache
+      - name: Verify frontend dist
+        if: inputs.deployment_type == 'frontend'
         run: |
-          gsutil defacl ch -u AllUsers:R gs://${{ env.GCS_FRONTEND_BUCKET }} || true
-          echo "Frontend deployed to: https://${{ env.GCS_FRONTEND_BUCKET }}"
+          if [ ! -d "${{ inputs.app_path }}/dist" ]; then
+            echo "❌ dist directory not found after build"
+            exit 1
+          fi
+          echo "📁 Frontend build contents:"
+          find ${{ inputs.app_path }}/dist -type f | head -20
+
+      - name: Upload frontend artifact
+        if: inputs.deployment_type == 'frontend'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.app_path }}/dist
+          retention-days: 1
+
+      # ==================== BACKEND BUILD ====================
+      - name: Set up Docker Buildx (Backend)
+        if: inputs.deployment_type == 'backend'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (Backend)
+        if: inputs.deployment_type == 'backend'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.app_path }}
+          tags: |
+            ${{ inputs.app_name }}:${{ github.sha }}
+            ${{ inputs.app_name }}:latest
+          load: true
+          push: false
+          outputs: type=docker,dest=/tmp/${{ inputs.app_name }}.tar
+
+      - name: Load Docker image
+        if: inputs.deployment_type == 'backend'
+        run: |
+          echo "📦 Loading Docker image..."
+          docker load --input /tmp/${{ inputs.app_name }}.tar
+
+      - name: Verify Docker image
+        if: inputs.deployment_type == 'backend'
+        run: |
+          echo "✅ Docker images loaded:"
+          docker images | grep ${{ inputs.app_name }}
+
+      - name: Run Trivy vulnerability scan
+        if: inputs.deployment_type == 'backend'
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: ${{ inputs.app_name }}:${{ github.sha }}
+          format: sarif
+          output: trivy-report.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          skip-version-check: true
+        continue-on-error: true
+
+      - name: Upload Trivy report
+        if: inputs.deployment_type == 'backend' && always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-report.sarif
+          category: container-scan
+        continue-on-error: true
+
+      - name: Upload backend artifact
+        if: inputs.deployment_type == 'backend'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: /tmp/${{ inputs.app_name }}.tar
+          retention-days: 1
+
+      - name: Set image URI
+        id: image-uri
+        if: inputs.deployment_type == 'backend'
+        run: |
+          IMAGE_URI="${{ env.ARTIFACT_REGISTRY_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ inputs.artifact_repo }}/${{ inputs.app_name }}:${{ github.sha }}"
+          echo "uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "📌 Image URI: ${IMAGE_URI}"
 
   # ============================================================
-  # JOB 2: Build & Push Docker Image to Artifact Registry
+  # MongoDB Validation Job (Backend only)
   # ============================================================
-  build-and-push-backend:
-    name: Build & Push Backend Docker Image
+  validate-mongodb:
+    name: Validate MongoDB Connection
+    needs: build
     runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.image.outputs.image }}
-
+    environment: ${{ inputs.environment }}
+    if: inputs.deployment_type == 'backend'
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Validate MongoDB connectivity
+        if: secrets.MONGODB_URL != ''
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URL }}
+        run: |
+          echo "🔗 Testing MongoDB connection..."
+          pip install pymongo --quiet
+          
+          python3 - <<'EOF'
+          import os
+          import sys
+          from pymongo import MongoClient
+          from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+          
+          uri = os.environ.get("MONGODB_URI")
+          if not uri:
+              print("⚠️  MONGODB_URI not set, skipping connection test")
+              sys.exit(0)
+          
+          try:
+              client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+              client.admin.command("ping")
+              print("✅ MongoDB connection successful")
+              
+              # List databases
+              databases = client.list_database_names()
+              print(f"📊 Available databases: {len(databases)}")
+              
+          except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+              print(f"❌ MongoDB connection failed: {e}")
+              sys.exit(1)
+          except Exception as e:
+              print(f"❌ Error: {e}")
+              sys.exit(1)
+          EOF
+
+      - name: Skip MongoDB validation
+        if: secrets.MONGODB_URL == ''
+        run: echo "⏭️ MongoDB validation skipped (MONGODB_URL not configured)"
+
+  # ============================================================
+  # Deploy Job (Frontend & Backend)
+  # ============================================================
+  deploy:
+    name: Deploy to GCP
+    needs: [build, validate-mongodb]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.validate-mongodb.result == 'success' || needs.validate-mongodb.result == 'skipped')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ./build-output
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Setup Cloud SDK
+      - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
-          project_id: ${{ env.PROJECT_ID }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Configure Docker for Artifact Registry
+      # ==================== FRONTEND DEPLOYMENT ====================
+      - name: Deploy frontend to GCS
+        if: inputs.deployment_type == 'frontend'
         run: |
-          gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY_LOCATION }}-docker.pkg.dev
+          echo "📤 Uploading frontend to GCS bucket: ${{ inputs.GCS_BUCKET_NAME }}"
+          gsutil -m cp -r ./build-output/* gs://${{ inputs.GCS_BUCKET_NAME }}/
+          
+          # Set proper caching for index.html
+          gsutil -h "Cache-Control:no-cache,max-age=0" cp gs://${{ inputs.GCS_BUCKET_NAME }}/index.html gs://${{ inputs.GCS_BUCKET_NAME }}/index.html
+          
+          # Set caching for static assets
+          gsutil -m -h "Cache-Control:public,max-age=31536000" cp -r gs://${{ inputs.GCS_BUCKET_NAME }}/*.{js,css,woff,woff2} gs://${{ inputs.GCS_BUCKET_NAME }}/ || true
 
-      - name: Build Docker image
-        working-directory: ./backend
+      - name: Verify GCS deployment
+        if: inputs.deployment_type == 'frontend'
         run: |
-          docker build -t ${{ env.ARTIFACT_REGISTRY_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/backend:${{ github.sha }} \
-                       -t ${{ env.ARTIFACT_REGISTRY_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/backend:latest .
+          echo "📋 Verifying frontend deployment..."
+          gsutil ls -r gs://${{ inputs.GCS_BUCKET_NAME }}/ | head -20
+
+      - name: Frontend deployment summary
+        if: inputs.deployment_type == 'frontend'
+        run: |
+          echo "✅ Frontend Deployment Complete"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Bucket: ${{ inputs.GCS_BUCKET_NAME }}"
+          echo "URL: https://storage.googleapis.com/${{ inputs.GCS_BUCKET_NAME }}/index.html"
+          echo "Environment: ${{ inputs.environment }}"
+
+      # ==================== BACKEND DEPLOYMENT ====================
+      - name: Load Docker image
+        if: inputs.deployment_type == 'backend'
+        run: |
+          echo "📦 Loading Docker image..."
+          docker load --input ./build-output/${{ inputs.app_name }}.tar
+
+      - name: Authenticate Docker to Artifact Registry
+        if: inputs.deployment_type == 'backend'
+        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY_LOCATION }}-docker.pkg.dev
 
       - name: Push Docker image to Artifact Registry
-        run: |
-          docker push ${{ env.ARTIFACT_REGISTRY_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/backend:${{ github.sha }}
-          docker push ${{ env.ARTIFACT_REGISTRY_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/backend:latest
-
-      - name: Set image output
-        id: image
-        run: echo "image=${{ env.ARTIFACT_REGISTRY_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REGISTRY_REPO }}/backend:${{ github.sha }}" >> $GITHUB_OUTPUT
-
-  # ============================================================
-  # JOB 3: Create/Update Cloud SQL Instance & Database
-  # ============================================================
-  setup-cloud-sql:
-    name: Setup Cloud SQL
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+        if: inputs.deployment_type == 'backend'
+        uses: docker/build-push-action@v5
         with:
-          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          context: ${{ inputs.app_path }}
+          tags: ${{ needs.build.outputs.image-uri }}
+          push: true
 
-      - name: Setup Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+      - name: Deploy to Cloud Run
+        if: inputs.deployment_type == 'backend'
+        uses: google-github-actions/deploy-cloudrun@v2
         with:
-          project_id: ${{ env.PROJECT_ID }}
-
-      - name: Create Cloud SQL instance (if not exists)
-        run: |
-          INSTANCE_EXISTS=$(gcloud sql instances describe ${{ env.SQL_INSTANCE }} --project=${{ env.PROJECT_ID }} 2>/dev/null || echo "")
-          if [ -z "$INSTANCE_EXISTS" ]; then
-            echo "Creating Cloud SQL instance..."
-            gcloud sql instances create ${{ env.SQL_INSTANCE }} \
-              --database-version=POSTGRES_15 \
-              --tier=db-f1-micro \
-              --region=${{ env.REGION }} \
-              --availability-type=REGIONAL \
-              --enable-bin-log \
-              --backup-start-time=03:00 \
-              --project=${{ env.PROJECT_ID }}
-            echo "Waiting for instance to be ready..."
-            sleep 30
-          else
-            echo "Cloud SQL instance already exists"
-          fi
-
-      - name: Create database (if not exists)
-        run: |
-          gcloud sql databases create ${{ env.DB_NAME }} \
-            --instance=${{ env.SQL_INSTANCE }} \
-            --project=${{ env.PROJECT_ID }} \
-            || echo "Database already exists"
-
-      - name: Create database user (if not exists)
-        run: |
-          gcloud sql users create ${{ env.DB_USER }} \
-            --instance=${{ env.SQL_INSTANCE }} \
-            --password=${{ secrets.DB_PASSWORD }} \
-            --project=${{ env.PROJECT_ID }} \
-            || echo "User already exists"
-
-      - name: Get Cloud SQL connection name
-        id: sql-conn
-        run: |
-          CONN_NAME=$(gcloud sql instances describe ${{ env.SQL_INSTANCE }} --project=${{ env.PROJECT_ID }} --format='value(connectionName)')
-          echo "connection_name=${CONN_NAME}" >> $GITHUB_OUTPUT
-
-  # ============================================================
-  # JOB 4: Create GCP Secrets
-  # ============================================================
-  create-secrets:
-    name: Create GCP Secrets
-    runs-on: ubuntu-latest
-    needs: setup-cloud-sql
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Setup Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.PROJECT_ID }}
-
-      - name: Get Cloud SQL connection name
-        id: sql-conn
-        run: |
-          CONN_NAME=$(gcloud sql instances describe ${{ env.SQL_INSTANCE }} --project=${{ env.PROJECT_ID }} --format='value(connectionName)')
-          echo "connection_name=${CONN_NAME}" >> $GITHUB_OUTPUT
-
-      - name: Create DATABASE_URL secret
-        run: |
-          DB_URL="postgresql://${{ env.DB_USER }}:${{ secrets.DB_PASSWORD }}@/${{ env.DB_NAME }}?host=/cloudsql/${{ steps.sql-conn.outputs.connection_name }}"
-          echo -n "$DB_URL" | gcloud secrets create db-url \
-            --data-file=- \
-            --project=${{ env.PROJECT_ID }} \
-            --replication-policy="user-managed" \
-            --locations=${{ env.REGION }} \
-            2>/dev/null || (echo -n "$DB_URL" | gcloud secrets versions add db-url --data-file=- --project=${{ env.PROJECT_ID }})
-
-      - name: Grant Cloud Run service account access to secret
-        run: |
-          SA_EMAIL=$(gcloud iam service-accounts list --filter="displayName:cloud-run-sa" --format='value(email)' --project=${{ env.PROJECT_ID }} || echo "")
-          if [ -n "$SA_EMAIL" ]; then
-            gcloud secrets add-iam-policy-binding db-url \
-              --member=serviceAccount:$SA_EMAIL \
-              --role=roles/secretmanager.secretAccessor \
-              --project=${{ env.PROJECT_ID }}
-          fi
-
-  # ============================================================
-  # JOB 5: Deploy to Cloud Run
-  # ============================================================
-  deploy-cloud-run:
-    name: Deploy to Cloud Run
-    runs-on: ubuntu-latest
-    needs: [build-and-push-backend, create-secrets]
-    if: github.ref == 'refs/heads/main'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Setup Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.PROJECT_ID }}
-
-      - name: Get Cloud SQL connection name
-        id: sql-conn
-        run: |
-          CONN_NAME=$(gcloud sql instances describe ${{ env.SQL_INSTANCE }} --project=${{ env.PROJECT_ID }} --format='value(connectionName)')
-          echo "connection_name=${CONN_NAME}" >> $GITHUB_OUTPUT
-
-      - name: Create or Update Cloud Run Service
-        run: |
-          gcloud run deploy ${{ env.CLOUD_RUN_SERVICE }} \
-            --image=${{ needs.build-and-push-backend.outputs.image }} \
-            --platform=managed \
-            --region=${{ env.REGION }} \
-            --allow-unauthenticated \
-            --port=${{ env.CONTAINER_PORT }} \
-            --memory=512Mi \
-            --cpu=1 \
-            --timeout=3600 \
-            --max-instances=100 \
-            --min-instances=1 \
-            --set-cloudsql-instances=${{ steps.sql-conn.outputs.connection_name }} \
-            --set-env-vars="DATABASE_URL=postgresql://${{ env.DB_USER }}:${{ secrets.DB_PASSWORD }}@/${{ env.DB_NAME }}?host=/cloudsql/${{ steps.sql-conn.outputs.connection_name }}" \
-            --project=${{ env.PROJECT_ID }}
+          service: ${{ inputs.cloud_run_service }}
+          image: ${{ needs.build.outputs.image-uri }}
+          region: ${{ env.REGION }}
+          env_vars: |
+            ENVIRONMENT=${{ inputs.environment }}
+            MONGODB_URL=${{ secrets.MONGODB_URL }}
+            FRONTEND_URL=${{ secrets.FRONTEND_URL }}
+            API_BASE_URL=${{ secrets.API_BASE_URL }}
 
       - name: Get Cloud Run Service URL
-        id: service
+        if: inputs.deployment_type == 'backend'
+        id: service-url
         run: |
-          SERVICE_URL=$(gcloud run services describe ${{ env.CLOUD_RUN_SERVICE }} \
-            --platform=managed \
+          SERVICE_URL=$(gcloud run services describe ${{ inputs.cloud_run_service }} \
             --region=${{ env.REGION }} \
-            --project=${{ env.PROJECT_ID }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
             --format='value(status.url)')
           echo "url=${SERVICE_URL}" >> $GITHUB_OUTPUT
 
-      - name: Print deployment info
+      - name: Backend deployment summary
+        if: inputs.deployment_type == 'backend'
         run: |
-          echo "✅ Deployment Complete!"
-          echo "🌐 Cloud Run Service: ${{ steps.service.outputs.url }}"
-          echo "📦 Docker Image: ${{ needs.build-and-push-backend.outputs.image }}"
-          echo "🗄️  Cloud SQL Instance: ${{ env.SQL_INSTANCE }}"
-          echo "📝 Database: ${{ env.DB_NAME }}"
+          echo "✅ Backend Deployment Complete"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Service: ${{ inputs.cloud_run_service }}"
+          echo "URL: ${{ steps.service-url.outputs.url }}"
+          echo "Image: ${{ needs.build.outputs.image-uri }}"
+          echo "Region: ${{ env.REGION }}"
+          echo "Environment: ${{ inputs.environment }}"
 
   # ============================================================
-  # JOB 6: Health Check
+  # Health Check Job
   # ============================================================
   health-check:
     name: Health Check
+    needs: deploy
     runs-on: ubuntu-latest
-    needs: deploy-cloud-run
-    if: github.ref == 'refs/heads/main'
-
+    if: inputs.deployment_type == 'backend'
+    
     steps:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -308,35 +496,69 @@ jobs:
           workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Setup Cloud SDK
+      - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.PROJECT_ID }}
 
       - name: Get Cloud Run Service URL
-        id: service
+        id: service-url
         run: |
-          SERVICE_URL=$(gcloud run services describe ${{ env.CLOUD_RUN_SERVICE }} \
-            --platform=managed \
-            --region=${{ env.REGION }} \
-            --project=${{ env.PROJECT_ID }} \
+          SERVICE_URL=$(gcloud run services describe ${{ inputs.cloud_run_service }} \
+            --region=${{ inputs.region }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
             --format='value(status.url)')
           echo "url=${SERVICE_URL}" >> $GITHUB_OUTPUT
 
       - name: Wait for service to be ready
         run: sleep 10
 
-      - name: Health check
+      - name: Perform health check
         run: |
+          SERVICE_URL="${{ steps.service-url.outputs.url }}"
+          echo "🏥 Performing health check on: ${SERVICE_URL}"
+          
           for i in {1..5}; do
-            echo "Attempt $i/5..."
-            if curl -f -s "${{ steps.service.outputs.url }}/docs" > /dev/null 2>&1; then
+            echo "   Attempt $i/5..."
+            
+            if curl -f -s "${SERVICE_URL}/docs" > /dev/null 2>&1; then
               echo "✅ Service is healthy!"
               exit 0
             fi
+            
             if [ $i -lt 5 ]; then
               sleep 15
             fi
           done
-          echo "⚠️ Service health check inconclusive, but deployment completed"
+          
+          echo "⚠️  Health check inconclusive, but deployment may be successful"
           exit 0
+
+  # ============================================================
+  # Summary Job
+  # ============================================================
+  summary:
+    name: Deployment Summary
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate deployment summary
+        run: |
+          echo "📊 DEPLOYMENT SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Application: ${{ inputs.app_name }}"
+          echo "Type: ${{ inputs.deployment_type }}"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Region: ${{ inputs.region }}"
+          echo "Timestamp: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo ""
+          echo "Build Status: ${{ needs.build.result }}"
+          echo "Deploy Status: ${{ needs.deploy.result }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "✅ Deployment Successful!"
+          else
+            echo "❌ Deployment Failed!"
+            exit 1
+          fi
