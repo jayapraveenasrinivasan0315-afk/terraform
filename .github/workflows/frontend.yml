@@ -24,7 +24,7 @@ jobs:
       app_name: frontend-app
       artifact_name: frontend-build
       region: asia-south1
-      GCS_BUCKET_NAME: frontend-123
+      GCS_BUCKET_NAME: gw-devops-frontend-bucket
     
     secrets:
       GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
