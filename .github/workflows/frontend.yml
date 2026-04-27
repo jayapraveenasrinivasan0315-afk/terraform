@@ -16,7 +16,7 @@ permissions:
   security-events: write
 jobs:
   deploy-frontend:
-    uses: ./.github/workflows/reusable-workflow.yml
+    uses: ./.github/workflows/resuable-workflow.yml
     with:
       deployment_type: frontend
       environment: development
