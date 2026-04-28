@@ -38,3 +38,5 @@ npm-debug.log*
 DEPLOYMENT_QUICKSTART.md
 GCP_DEPLOYMENT_CONFIG.md
 GITHUB_SECRETS_SETUP.md
+.env.example
+.env
